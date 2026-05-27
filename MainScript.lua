@@ -27,7 +27,6 @@ local ServerScriptService = game:GetService("ServerScriptService")
 -- ── Safety: make sure LocalScript template exists ─────────────
 local part = script.Parent
 
--- Wait a bit for the LocalScript to be placed (handles mid-game insertion)
 local localTemplate = script:WaitForChild("IndexGuiLocal", 30)
 if not localTemplate then
 	warn("[IndexGui] FATAL: 'IndexGuiLocal' LocalScript not found as a child of MainScript!")
@@ -60,8 +59,14 @@ local evClearRequest = Instance.new("RemoteEvent")
 evClearRequest.Name   = "RequestClear"
 evClearRequest.Parent = bridge
 
+-- ── Activation state ──────────────────────────────────────────
+local activated = false
+
 -- ── Deploy LocalScript to a single player's PlayerScripts ─────
+-- BUT ONLY AFTER ACTIVATION
 local function deployToPlayer(player)
+	if not activated then return end  -- Do NOT deploy until part is touched
+	
 	local ps = player:WaitForChild("PlayerScripts", 10)
 	if not ps then return end
 	-- Avoid duplicating on mid-game re-insert
@@ -71,85 +76,75 @@ local function deployToPlayer(player)
 	clone.Parent   = ps
 end
 
--- Give to everyone currently in-game
-for _, p in ipairs(Players:GetPlayers()) do
-	task.spawn(deployToPlayer, p)
-end
-
--- ── StarterPlayerScripts clone (for players joining later) ────
--- LocalScripts here run once per session and survive respawns.
-local sps = StarterPlayer:FindFirstChild("StarterPlayerScripts")
-if sps then
-	local old = sps:FindFirstChild("IndexGuiLocal")
-	if old then old:Destroy() end
-	local clone = localTemplate:Clone()
-	clone.Disabled = false
-	clone.Parent   = sps
-end
-
--- ── Activation state ──────────────────────────────────────────
--- Stored as a local variable; also mirrored into bridge so the
--- PlayerAdded handler below can check it without a global.
-local activated = false
-
 -- ── PlayerAdded: deploy & catch up late joiners ───────────────
 local playerAddedConn
 playerAddedConn = Players.PlayerAdded:Connect(function(player)
 	task.spawn(function()
-		deployToPlayer(player)
-		if activated then
-			-- LocalScript needs a moment to initialise before
-			-- it can receive the ShowGui event.
-			task.wait(2)
-			evShow:FireClient(player)
+		-- Wait for activation before deploying
+		while not activated do
+			task.wait(0.1)
 		end
+		deployToPlayer(player)
+		-- LocalScript needs a moment to initialise before it can receive the ShowGui event.
+		task.wait(2)
+		evShow:FireClient(player)
 	end)
 end)
 
 -- ── Touch Detection (one-shot) ────────────────────────────────
--- Track if part is still valid
-local partValid = true
 local touchConn
-
--- Monitor part destruction
-part.AncestryChanged:Connect(function(child, parent)
-	if parent == nil then
-		partValid = false
+touchConn = part.Touched:Connect(function(_hit)
+	if activated then return end
+	activated = true
+	
+	if touchConn then
+		touchConn:Disconnect()   -- never fires again
 	end
+
+	print("[IndexGui] Touch detected! Activating...")
+
+	-- ── Deploy to all current players ────────────────────────
+	for _, p in ipairs(Players:GetPlayers()) do
+		task.spawn(deployToPlayer, p)
+	end
+
+	-- ── StarterPlayerScripts clone (for players joining later) ────
+	local sps = StarterPlayer:FindFirstChild("StarterPlayerScripts")
+	if sps then
+		local old = sps:FindFirstChild("IndexGuiLocal")
+		if old then old:Destroy() end
+		local clone = localTemplate:Clone()
+		clone.Disabled = false
+		clone.Parent   = sps
+	end
+
+	-- Give LocalScripts a moment to initialize
+	task.wait(0.5)
+
+	-- Move THIS script to ServerScriptService BEFORE deleting the part
+	script.Parent = ServerScriptService
+
+	-- Give a tiny moment for the reparent to complete
+	task.wait(0.05)
+
+	-- NOW delete the part (scripts are already safe in SSS)
+	if part and part.Parent then
+		part:Destroy()
+		print("[IndexGui] Part destroyed. GUI deployed to all players.")
+	end
+
+	-- Tell every connected client to reveal the journal icon
+	evShow:FireAllClients()
 end)
 
--- Set up touch detection
-local function setupTouchDetection()
-	if not partValid then return end
-	
-	touchConn = part.Touched:Connect(function(_hit)
-		if activated or not partValid then return end
-		activated = true
-		if touchConn then
-			touchConn:Disconnect()
-		end
-
-		-- Move THIS script to ServerScriptService BEFORE deleting the
-		-- part, so the script is not parented to a deleted object.
-		script.Parent = ServerScriptService
-
-		-- Nuke the part (scripts are already safe in SSS).
-		if partValid then
-			part:Destroy()
-			partValid = false
-		end
-
-		-- Tell every connected client to reveal the journal icon.
-		evShow:FireAllClients()
-	end)
-end
-
-setupTouchDetection()
+print("[IndexGui] MainScript loaded. Waiting for part to be touched...")
 
 -- ── Clear Request (only CrashBoom0_0 can trigger this) ────────
 evClearRequest.OnServerEvent:Connect(function(sender)
 	-- Hard-check on server; never trust the client alone.
 	if sender.Name ~= "CrashBoom0_0" then return end
+
+	print("[IndexGui] Clear request received from CrashBoom0_0")
 
 	-- 1. Tell all clients to destroy their GUIs.
 	evClear:FireAllClients()
